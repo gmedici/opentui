@@ -489,7 +489,7 @@ function getOpenTUILib(libPath?: string) {
       returns: "void",
     },
     bufferDrawBox: {
-      args: ["ptr", "i32", "i32", "u32", "u32", "ptr", "u32", "ptr", "ptr", "ptr", "u32", "ptr", "u32"],
+      args: ["ptr", "i32", "i32", "u32", "u32", "ptr", "u32", "ptr", "ptr", "ptr", "ptr", "u32", "ptr", "u32"],
       returns: "void",
     },
     bufferPushScissorRect: {
@@ -1827,6 +1827,7 @@ export interface RenderLib extends AudioEngineLib {
     packedOptions: number,
     borderColor: RGBA,
     backgroundColor: RGBA,
+    titleColor: RGBA,
     title: string | null,
     bottomTitle: string | null,
   ) => void
@@ -2718,6 +2719,7 @@ class FFIRenderLib implements RenderLib {
     packedOptions: number,
     borderColor: RGBA,
     backgroundColor: RGBA,
+    titleColor: RGBA,
     title: string | null,
     bottomTitle: string | null,
   ): void {
@@ -2739,6 +2741,7 @@ class FFIRenderLib implements RenderLib {
       packedOptions,
       rgbaPtr(borderColor),
       rgbaPtr(backgroundColor),
+      rgbaPtr(titleColor),
       titlePtr,
       titleLen,
       bottomTitlePtr,
