@@ -31,13 +31,13 @@ const mountSolidRoot = (renderer: CliRenderer, node: () => JSX.Element) => {
 
   renderer.once("destroy", runDispose)
 
-  renderer.destroy = () => {
+  renderer.destroy = (): Promise<void> => {
     if (mounting) {
       destroyRequested = true
-      return
+      return renderer.closed
     }
 
-    originalDestroy()
+    return originalDestroy()
   }
 
   try {

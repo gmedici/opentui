@@ -1,3 +1,5 @@
+import { writeSync } from "node:fs"
+
 import { ANSI } from "./ansi.js"
 import { Renderable, RootRenderable } from "./Renderable.js"
 import { BoxRenderable } from "./renderables/Box.js"
@@ -528,6 +530,27 @@ const DEFAULT_FORWARDED_ENV_KEYS = [
 const NATIVE_RENDER_STATUS_SKIPPED = 1
 const NATIVE_RENDER_STATUS_FAILED = 2
 
+const TERMINAL_HARD_RESTORE =
+  "\x1b[?2026l" +
+  "\x1b[?1003l" +
+  "\x1b[?1002l" +
+  "\x1b[?1000l" +
+  "\x1b[?1006l" +
+  "\x1b[?1016l" +
+  "\x1b[?1004l" +
+  "\x1b[?2004l" +
+  "\x1b[?2031l" +
+  "\x1b[?2027l" +
+  "\x1b[<u" +
+  "\x1b[>4;0m" +
+  "\x1b[r" +
+  "\x1b[?25h" +
+  "\x1b[0m" +
+  "\x1b[0 q" +
+  "\x1b]112\x07" +
+  "\x1b]12;default\x07" +
+  "\x1b[?1049l"
+
 // Kitty keyboard protocol flags
 // See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 const KITTY_FLAG_DISAMBIGUATE = 0b1 // Report disambiguated escape codes
@@ -728,8 +751,21 @@ export class CliRenderer extends EventEmitter implements RenderContext {
   private _isDestroyed: boolean = false
   private _destroyPending: boolean = false
   private _destroyFinalized: boolean = false
+  private _destroyCompletionEmitted: boolean = false
   private _destroyCleanupPrepared: boolean = false
+  private _terminalRestorePrepared: boolean = false
   private _streamLeaseAcquired: boolean = false
+  // `closed` resolves only after finalizeDestroy() has completed, including
+  // any async flush of TERMINAL_HARD_RESTORE on non-fd Writables. `destroy()`
+  // returns this same promise so callers may either `await renderer.destroy()`
+  // or `renderer.destroy(); await renderer.closed`.
+  private _closedPromise: Promise<void> | null = null
+  private _closedResolver: (() => void) | null = null
+  // Tracks completion of the hard restore write. For fd-backed stdouts the
+  // write is synchronous via fs.writeSync and this stays Promise.resolve().
+  // For custom Writables we capture the stream write callback so `closed`
+  // does not resolve before the bytes are actually flushed.
+  private _hardRestoreFlushed: Promise<void> = Promise.resolve()
   public nextRenderBuffer: OptimizedBuffer
   public currentRenderBuffer: OptimizedBuffer
   private _isRunning: boolean = false
@@ -892,9 +928,12 @@ export class CliRenderer extends EventEmitter implements RenderContext {
   private handleError: (error: Error) => void = ((error: Error) => {
     console.error(error)
 
-    if (this._openConsoleOnError) {
-      this.console.show()
+    if (!this._openConsoleOnError) {
+      void this.destroy()
+      return
     }
+
+    this.console.show()
   }).bind(this)
 
   private dumpOutputCache(optionalMessage: string = ""): void {
@@ -936,6 +975,45 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       sleep(100).then(() => {
         this.dumpOutputCache("=== CAPTURED OUTPUT ===\n")
       })
+    }
+  }).bind(this)
+
+  // Last-resort synchronous terminal restore that runs on `process.on("exit")`.
+  // Covers paths that bypass normal destroy(): uncaughtException with no
+  // handler that recovers, unhandledRejection with --unhandled-rejections=strict,
+  // an explicit process.exit() called by the host application, or the natural
+  // event-loop-empty exit. The 'exit' event handler must be synchronous (Node
+  // ignores async work after it returns), which is fine because writeSync is
+  // synchronous. Idempotency is guaranteed by _terminalRestorePrepared.
+  // SIGKILL cannot be intercepted; this is the best we can do from JS.
+  //
+  // process.on("exit") can only guarantee restoration for fd-backed stdout.
+  // For custom Writables, callers must use await renderer.destroy() before
+  // closing the transport or exiting the process.
+  private processExitHandler: () => void = (() => {
+    if (!this._terminalIsSetup) return
+
+    try {
+      this.stdin.setRawMode?.(false)
+    } catch {
+      // best effort
+    }
+
+    try {
+      this.stdin.pause()
+    } catch {
+      // best effort
+    }
+
+    if (this._terminalRestorePrepared) return
+    this._terminalRestorePrepared = true
+    const fd = (this.stdout as NodeJS.WriteStream & { fd?: number }).fd
+    if (typeof fd === "number") {
+      try {
+        writeSync(fd, TERMINAL_HARD_RESTORE)
+      } catch {
+        // best effort
+      }
     }
   }).bind(this)
 
@@ -1170,6 +1248,9 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     process.on("uncaughtException", this.handleError)
     process.on("unhandledRejection", this.handleError)
     process.on("beforeExit", this.exitHandler)
+    // Synchronous last-resort restore. Cheap to register and idempotent with
+    // normal destroy() teardown via _terminalRestorePrepared.
+    process.on("exit", this.processExitHandler)
 
     const useKittyForParsing = kittyConfig !== null
     this._keyHandler = new InternalKeyHandler()
@@ -4118,19 +4199,54 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
   }
 
-  public destroy(): void {
-    if (this._isDestroyed) return
+  // `closed` resolves only after the renderer has been fully torn down:
+  // terminal modes restored (and on non-fd Writables, the restore bytes
+  // flushed through the underlying stream), native renderer destroyed,
+  // feed closed, and the `destroy` event emitted. Safe to access before
+  // destroy(); the same promise is returned later.
+  //
+  // Strong guarantee: when stdout exposes a numeric fd (the common case
+  // for process.stdout), terminal restore bytes have hit the kernel by the
+  // time this resolves and the calling process may safely process.exit().
+  // For custom Writables the promise still awaits the stream's write
+  // callback, but the host must keep its transport alive long enough for
+  // the callback to fire.
+  public get closed(): Promise<void> {
+    if (!this._closedPromise) {
+      if (this._destroyFinalized) {
+        this._closedPromise = Promise.resolve()
+      } else {
+        this._closedPromise = new Promise<void>((resolve) => {
+          this._closedResolver = resolve
+        })
+      }
+    }
+    return this._closedPromise
+  }
+
+  // Returns a promise resolving under the same contract as `closed`.
+  // Existing callers that ignore the return value keep working. New callers can
+  // await renderer.destroy() or await renderer.closed for completion-safe teardown.
+  public destroy(): Promise<void> {
+    if (this._isDestroyed) return this.closed
     this._isDestroyed = true
     this._destroyPending = true
     this._palettePublishGeneration++
 
+    // Materialize the closed promise BEFORE any teardown work so that the
+    // resolver is bound and can be fired from finalizeDestroy(). Capturing
+    // it here also ensures the returned promise is identical to
+    // `renderer.closed` for the lifetime of this instance.
+    const closedPromise = this.closed
+
     if (this.rendering) {
       // Restore terminal/input state immediately, but defer full native teardown until the frame unwinds.
       this.prepareDestroyDuringRender()
-      return
+      return closedPromise
     }
 
     this.finalizeDestroy()
+    return closedPromise
   }
 
   private cleanupBeforeDestroy(): void {
@@ -4144,6 +4260,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     process.removeListener("unhandledRejection", this.handleError)
     process.removeListener("warning", this.warningHandler)
     process.removeListener("beforeExit", this.exitHandler)
+    process.removeListener("exit", this.processExitHandler)
     this.removeExitListeners()
 
     if (this.resizeTimeoutId !== null) {
@@ -4209,9 +4326,68 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
   }
 
+  private writeHardTerminalRestore(): void {
+    if (!this._terminalIsSetup) return
+
+    const fd = (this.stdout as NodeJS.WriteStream & { fd?: number }).fd
+    if (typeof fd === "number") {
+      try {
+        // Fast path: synchronous fd write bypasses the Writable pipeline and
+        // libuv buffers entirely. Bytes hit the kernel before this returns,
+        // so callers may safely process.exit() immediately afterwards.
+        writeSync(fd, TERMINAL_HARD_RESTORE)
+        this._hardRestoreFlushed = Promise.resolve()
+        return
+      } catch (e) {
+        console.error("Error writing synchronous terminal restore during destroy:", e)
+      }
+    }
+
+    // Fallback path: custom Writable without a numeric fd (e.g. an SSH
+    // transport, an in-memory buffer, or a wrapped pipe). We cannot do a
+    // truly synchronous write here, but we still call .write() immediately
+    // and capture the flush callback so `renderer.closed` does not resolve
+    // before the underlying stream has finished draining the restore bytes.
+    this._hardRestoreFlushed = new Promise<void>((resolve) => {
+      let settled = false
+      const done = (): void => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      try {
+        this.realStdoutWrite.call(this.stdout, TERMINAL_HARD_RESTORE, undefined, () => done())
+      } catch (e) {
+        console.error("Error writing terminal restore during destroy:", e)
+        done()
+      }
+    })
+  }
+
+  private prepareTerminalRestoreForDestroy(): void {
+    if (this._terminalRestorePrepared) return
+    this._terminalRestorePrepared = true
+
+    this.writeHardTerminalRestore()
+
+    if (this._feed) {
+      try {
+        this._feed.drainAll()
+      } catch (e) {
+        console.error("Error draining NativeSpanFeed terminal restore during destroy:", e)
+      }
+    }
+  }
+
   private prepareDestroyDuringRender(): void {
     this.cleanupBeforeDestroy()
-    this.lib.suspendRenderer(this.rendererPtr)
+    this.prepareTerminalRestoreForDestroy()
+
+    try {
+      this.lib.suspendRenderer(this.rendererPtr)
+    } catch (e) {
+      console.error("Error suspending renderer during destroy:", e)
+    }
   }
 
   private finalizeDestroy(): void {
@@ -4221,6 +4397,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this._destroyPending = false
 
     this.cleanupBeforeDestroy()
+    this.prepareTerminalRestoreForDestroy()
 
     // Clean up palette detector
     if (this._paletteDetector) {
@@ -4236,8 +4413,6 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     this.resolveXtVersionWaiters()
 
     this.themeModeState.dispose()
-
-    this.emit(CliRenderEvents.DESTROY)
 
     try {
       this.root.destroyRecursively()
@@ -4281,6 +4456,14 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     //      before `feed.close()`, otherwise `close()` will wait for any
     //      in-flight writes that reference chunks about to be freed.
     //
+    // Note: `prepareTerminalRestoreForDestroy()` already wrote the hard
+    // restore sequence directly to the stdout fd (or via the fallback path)
+    // and called `_feed.drainAll()` once before we got here. That happens
+    // BEFORE step (a) below and is what makes destroy() completion-safe for
+    // terminal modes (mouse, raw, alt-screen, kitty-keyboard). The steps
+    // below additionally flush any in-flight render frames and the native
+    // renderer's own shutdown bytes so the feed and native side are clean.
+    //
     // The correct order is:
     //   a) drain any frames already committed but not yet delivered
     //   b) call lib.destroyRenderer — this commits shutdown bytes into the feed
@@ -4293,14 +4476,8 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     // owned by the TS side and only released by `feed.close()` at step (e).
     // Consequently, step (c)'s drain operates on still-valid chunk memory;
     // there is no use-after-free window between (b) and (e).
-    //
-    // Caller note: `feed.close()` is queued as a microtask when async handlers
-    // from the final drain are still pending. If the caller tears down the
-    // underlying Writable synchronously right after `destroy()` returns (e.g.
-    // `channel.close()` on the very next line, or `process.exit()`), the
-    // shutdown bytes may not have flushed yet. For async teardown, allow one
-    // microtask tick (e.g. `await new Promise(queueMicrotask)`) before closing
-    // the transport.
+    let feedClosed: Promise<void> = Promise.resolve()
+
     if (this._feed) {
       try {
         this._feed.drainAll()
@@ -4322,8 +4499,9 @@ export class CliRenderer extends EventEmitter implements RenderContext {
     }
 
     if (this._feed) {
+      const feed = this._feed
       try {
-        this._feed.drainAll()
+        feed.drainAll()
       } catch (e) {
         console.error("Error draining NativeSpanFeed shutdown frames:", e)
       }
@@ -4331,7 +4509,7 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       this._detachFeed = null
       this._detachFeedError?.()
       this._detachFeedError = null
-      this._feed.close()
+      feedClosed = feed.close()
       this._feed = null
     }
 
@@ -4341,6 +4519,22 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       this._streamLeaseAcquired = false
     }
 
+    // Resolve idle waiters now that state is final (feed is nulled, but the
+    // deferred completion event/promise still fire later via microtask).
+    this.resolveIdleIfNeeded()
+
+    void Promise.all([this._hardRestoreFlushed, feedClosed]).then(
+      () => this.finishDestroyCompletion(),
+      () => this.finishDestroyCompletion(),
+    )
+  }
+
+  private finishDestroyCompletion(): void {
+    if (this._destroyCompletionEmitted) return
+    this._destroyCompletionEmitted = true
+
+    this.emit(CliRenderEvents.DESTROY)
+
     if (this._onDestroy) {
       try {
         this._onDestroy()
@@ -4349,8 +4543,13 @@ export class CliRenderer extends EventEmitter implements RenderContext {
       }
     }
 
-    // Resolve any pending idle() calls
     this.resolveIdleIfNeeded()
+
+    const resolver = this._closedResolver
+    if (resolver) {
+      this._closedResolver = null
+      resolver()
+    }
   }
 
   private startRenderLoop(): void {

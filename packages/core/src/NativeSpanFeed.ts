@@ -85,6 +85,8 @@ export class NativeSpanFeed {
   private idleResolvers: Array<() => void> = []
   private pendingHandlerError: unknown = null
   private pendingHandlerErrorQueued = false
+  private closePromise: Promise<void> | null = null
+  private closeResolver: (() => void) | null = null
 
   private constructor(streamPtr: Pointer) {
     this.streamPtr = streamPtr
@@ -126,8 +128,19 @@ export class NativeSpanFeed {
     return this.pendingAsyncHandlers > 0 || this.pendingDataAvailable || this.hasPinnedChunks()
   }
 
-  close(): void {
-    if (this.destroyed) return
+  private getClosePromise(): Promise<void> {
+    if (this.destroyed) return Promise.resolve()
+    if (!this.closePromise) {
+      this.closePromise = new Promise<void>((resolve) => {
+        this.closeResolver = resolve
+      })
+    }
+    return this.closePromise
+  }
+
+  close(): Promise<void> {
+    const closed = this.getClosePromise()
+    if (this.destroyed) return closed
     if (this.inCallback || this.draining || this.pendingAsyncHandlers > 0) {
       this.pendingClose = true
       if (!this.closeQueued) {
@@ -137,9 +150,10 @@ export class NativeSpanFeed {
           this.processPendingClose()
         })
       }
-      return
+      return closed
     }
     this.performClose()
+    return closed
   }
 
   private processPendingClose(): void {
@@ -177,6 +191,11 @@ export class NativeSpanFeed {
     this.errorHandlers.clear()
     this.pendingDataAvailable = false
     this.resolveIdleIfNeeded()
+    const resolver = this.closeResolver
+    if (resolver) {
+      this.closeResolver = null
+      resolver()
+    }
   }
 
   private isIdle(): boolean {
